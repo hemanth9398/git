@@ -1,0 +1,117 @@
+# KEDA ScaledObject for KubeRay autoscaling based on vLLM queue depth.
+# Scales the decode worker deployment when average queue depth exceeds threshold.
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: vllm-decode-scaler
+  namespace: inference-gateway
+spec:
+  scaleTargetRef:
+    apiVersion: ray.io/v1
+    kind: RayCluster
+    name: vllm-inference-cluster
+  pollingInterval: 15
+  cooldownPeriod: 120
+  minReplicaCount: 8
+  maxReplicaCount: 64
+  advanced:
+    restoreToOriginalReplicaCount: false
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+            - type: Pods
+              value: 4
+              periodSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Pods
+              value: 2
+              periodSeconds: 120
+  triggers:
+    # Scale up when average queue depth across decode nodes > 30 requests.
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+        metricName: vllm_num_requests_waiting
+        threshold: "30"
+        query: avg(vllm_num_requests_waiting{role="decode-worker"})
+    # Scale up when KV-cache utilization > 80%.
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+        metricName: vllm_kv_cache_usage_perc
+        threshold: "80"
+        query: max(vllm_kv_cache_usage_perc{role="decode-worker"})
+
+---
+# KEDA ScaledObject for prefill workers.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: vllm-prefill-scaler
+  namespace: inference-gateway
+spec:
+  scaleTargetRef:
+    apiVersion: ray.io/v1
+    kind: RayCluster
+    name: vllm-inference-cluster
+  pollingInterval: 15
+  cooldownPeriod: 120
+  minReplicaCount: 4
+  maxReplicaCount: 32
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+        metricName: vllm_num_requests_waiting
+        threshold: "20"
+        query: avg(vllm_num_requests_waiting{role="prefill-worker"})
+
+---
+# KEDA cron-based scaler: scale decode fleet to minimum during off-hours
+# (00:00–06:00 UTC) to reduce GPU costs.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: vllm-decode-cron-scaler
+  namespace: inference-gateway
+spec:
+  scaleTargetRef:
+    apiVersion: ray.io/v1
+    kind: RayCluster
+    name: vllm-inference-cluster
+  minReplicaCount: 2
+  maxReplicaCount: 64
+  triggers:
+    - type: cron
+      metadata:
+        timezone: UTC
+        start: "0 0 * * *"   # midnight UTC — scale down
+        end: "0 6 * * *"     # 06:00 UTC   — scale back up
+        desiredReplicas: "2"
+
+---
+# Horizontal Pod Autoscaler for the metrics collector deployment.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: metrics-collector-hpa
+  namespace: inference-gateway
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: metrics-collector
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

@@ -1,0 +1,103 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: inference-routes
+  namespace: inference-gateway
+spec:
+  parentRefs:
+    - name: inference-gateway
+      namespace: inference-gateway
+      sectionName: https
+
+  hostnames:
+    - "api.inference.example.com"
+
+  rules:
+    # ── Health check (no auth required) ──────────────────────────────────
+    - matches:
+        - path:
+            type: Exact
+            value: /health
+      backendRefs:
+        - name: vllm-decode
+          port: 8000
+          weight: 1
+
+    # ── OpenAI-compatible chat completions (main inference path) ──────────
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1/chat/completions
+        - path:
+            type: PathPrefix
+            value: /v1/completions
+        - path:
+            type: PathPrefix
+            value: /v1/embeddings
+      filters:
+        # Add CORS headers for browser-based clients.
+        - type: ResponseHeaderModifier
+          responseHeaderModifier:
+            add:
+              - name: Access-Control-Allow-Origin
+                value: "*"
+              - name: Access-Control-Allow-Methods
+                value: "GET, POST, OPTIONS"
+              - name: Access-Control-Allow-Headers
+                value: "Authorization, Content-Type, X-Request-ID"
+        # Propagate trace context.
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            add:
+              - name: X-Forwarded-For
+                value: "%REQ(X-FORWARDED-FOR)%"
+      timeouts:
+        request: 300s
+        backendRequest: 300s
+      backendRefs:
+        - name: vllm-decode
+          port: 8000
+          weight: 95   # 95% to stable decode cluster
+        - name: vllm-decode-canary
+          port: 8000
+          weight: 5    # 5% to canary for zero-downtime upgrades
+
+    # ── Model listing ─────────────────────────────────────────────────────
+    - matches:
+        - path:
+            type: Exact
+            value: /v1/models
+      backendRefs:
+        - name: vllm-decode
+          port: 8000
+
+    # ── HTTP → HTTPS redirect ─────────────────────────────────────────────
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301
+
+---
+# Shadow route: mirror 1% of traffic to new model version for quality validation.
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: HTTPRoute
+metadata:
+  name: inference-shadow
+  namespace: inference-gateway
+spec:
+  parentRefs:
+    - name: inference-gateway
+      namespace: inference-gateway
+  rules:
+    - matches:
+        - headers:
+            - name: X-Shadow-Request
+              value: "true"
+      backendRefs:
+        - name: vllm-decode-shadow
+          port: 8000

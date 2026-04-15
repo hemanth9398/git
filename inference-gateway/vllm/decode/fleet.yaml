@@ -1,0 +1,164 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: vllm-decode-cluster
+  namespace: inference-gateway
+  labels:
+    app: vllm-decode
+    component: inference-gateway
+spec:
+  rayVersion: "2.10.0"
+
+  headGroupSpec:
+    serviceType: ClusterIP
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+      num-cpus: "4"
+      num-gpus: "0"
+      block: "true"
+    template:
+      metadata:
+        labels:
+          role: head
+          app: vllm-decode
+      spec:
+        nodeSelector:
+          node-role: inference-head
+        containers:
+          - name: ray-head
+            image: rayproject/ray-ml:2.10.0-gpu
+            resources:
+              requests:
+                cpu: "4"
+                memory: "16Gi"
+              limits:
+                cpu: "8"
+                memory: "32Gi"
+            volumeMounts:
+              - name: shm
+                mountPath: /dev/shm
+        volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 16Gi
+
+  workerGroupSpecs:
+    - groupName: decode-workers
+      replicas: 16
+      minReplicas: 8
+      maxReplicas: 64
+      rayStartParams:
+        num-gpus: "8"
+        num-cpus: "64"
+        block: "true"
+      template:
+        metadata:
+          labels:
+            role: decode-worker
+            app: vllm-decode
+        spec:
+          # Schedule on A100 PCIe node pool (memory-bandwidth-optimised for decode).
+          nodeSelector:
+            cloud.google.com/gke-accelerator: nvidia-a100-80gb
+            node-role: decode
+          tolerations:
+            - key: nvidia.com/gpu
+              operator: Exists
+              effect: NoSchedule
+            - key: decode-only
+              operator: Exists
+              effect: NoSchedule
+          affinity:
+            podAntiAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 100
+                  podAffinityTerm:
+                    labelSelector:
+                      matchLabels:
+                        role: decode-worker
+                    topologyKey: kubernetes.io/hostname
+          containers:
+            - name: vllm-decode
+              image: vllm/vllm-openai:v0.4.3
+              command:
+                - python
+                - /workspace/decode_worker.py
+              ports:
+                - name: http
+                  containerPort: 8000
+                - name: metrics
+                  containerPort: 8001
+                - name: kv-recv
+                  containerPort: 8100
+              env:
+                - name: VLLM_WORKER_MULTIPROC_METHOD
+                  value: spawn
+                - name: VLLM_WORKER_USE_RAY
+                  value: "1"
+                - name: VLLM_ROLE
+                  value: decode
+                - name: NCCL_DEBUG
+                  value: WARN
+              resources:
+                requests:
+                  cpu: "60"
+                  memory: "480Gi"
+                  nvidia.com/gpu: "8"
+                limits:
+                  cpu: "64"
+                  memory: "512Gi"
+                  nvidia.com/gpu: "8"
+              readinessProbe:
+                httpGet:
+                  path: /health
+                  port: 8000
+                initialDelaySeconds: 60
+                periodSeconds: 10
+                failureThreshold: 3
+              livenessProbe:
+                httpGet:
+                  path: /health
+                  port: 8000
+                initialDelaySeconds: 120
+                periodSeconds: 30
+                failureThreshold: 5
+              lifecycle:
+                preStop:
+                  exec:
+                    command: ["/bin/sh", "-c", "sleep 30"]
+              volumeMounts:
+                - name: shm
+                  mountPath: /dev/shm
+                - name: model-cache
+                  mountPath: /model-cache
+          volumes:
+            - name: shm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 64Gi
+            - name: model-cache
+              persistentVolumeClaim:
+                claimName: model-weights-pvc
+          terminationGracePeriodSeconds: 60
+
+---
+# Headless service so prefill workers can address individual decode pods
+# for KV-cache push.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-decode-headless
+  namespace: inference-gateway
+spec:
+  clusterIP: None
+  selector:
+    app: vllm-decode
+    role: decode-worker
+  ports:
+    - name: kv-recv
+      port: 8100
+      targetPort: 8100
+    - name: http
+      port: 8000
+      targetPort: 8000

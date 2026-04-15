@@ -1,0 +1,181 @@
+groups:
+  - name: llm_inference_gateway
+    interval: 30s
+    rules:
+
+      # ── SLO alerts ────────────────────────────────────────────────────────
+
+      - alert: HighTimeToFirstToken
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(vllm_time_to_first_token_seconds_bucket[5m])) by (le)
+          ) > 1.0
+        for: 5m
+        labels:
+          severity: critical
+          team: ml-platform
+        annotations:
+          summary: "TTFT p99 > 1s for 5 minutes"
+          description: |
+            Time-to-first-token p99 is {{ $value | humanizeDuration }} (SLO: 500ms).
+            This may indicate prefill workers are overloaded or the KV-cache is full.
+          runbook_url: "https://wiki.internal/runbooks/llm-gateway/high-ttft"
+
+      - alert: HighInterTokenLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(vllm_inter_token_latency_seconds_bucket[5m])) by (le)
+          ) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "Inter-token latency p99 > 100ms (SLO: 50ms)"
+          description: |
+            ITL p99 = {{ $value | humanizeDuration }}.
+            Decode workers may be overloaded. Check queue depth and KV-cache usage.
+
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(vllm_decode_requests_total{status="error"}[5m]))
+          /
+          sum(rate(vllm_decode_requests_total[5m])) > 0.001
+        for: 2m
+        labels:
+          severity: critical
+          team: ml-platform
+        annotations:
+          summary: "LLM inference error rate > 0.1%"
+          description: |
+            Error rate = {{ $value | humanizePercentage }}.
+            Check vLLM worker logs and Envoy access logs for 5xx errors.
+
+      # ── Resource alerts ───────────────────────────────────────────────────
+
+      - alert: KVCacheNearFull
+        expr: |
+          max(vllm_kv_cache_usage_perc) > 85
+        for: 2m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "GPU KV-cache > 85% on at least one node"
+          description: |
+            Node {{ $labels.node }} KV-cache is {{ $value }}% full.
+            New requests may be rejected with 503. Trigger scale-up if not already happening.
+
+      - alert: KVCacheCritical
+        expr: |
+          max(vllm_kv_cache_usage_perc) > 95
+        for: 1m
+        labels:
+          severity: critical
+          team: ml-platform
+        annotations:
+          summary: "GPU KV-cache > 95% — imminent OOM evictions"
+          description: |
+            Node {{ $labels.node }} KV-cache = {{ $value }}%.
+            Request preemptions and re-computations are likely. Scale up immediately.
+
+      - alert: RequestQueueDepthHigh
+        expr: |
+          max(vllm_num_requests_waiting) > 50
+        for: 2m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "Request queue depth > 50 on at least one node"
+          description: |
+            Node {{ $labels.node }} has {{ $value }} requests waiting.
+            Consider scaling out decode workers or enabling load shedding.
+
+      - alert: RequestQueueDepthCritical
+        expr: |
+          max(vllm_num_requests_waiting) > 100
+        for: 1m
+        labels:
+          severity: critical
+          team: ml-platform
+        annotations:
+          summary: "Request queue depth > 100 — load shedding required"
+          description: |
+            Node {{ $labels.node }} queue depth = {{ $value }}.
+            Envoy rate-limiting and 503 responses are now active.
+
+      # ── Prefix cache alerts ───────────────────────────────────────────────
+
+      - alert: PrefixCacheHitRateLow
+        expr: |
+          avg(vllm_prefix_cache_hit_rate) < 0.3
+        for: 15m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "Prefix cache hit rate < 30% for 15 minutes"
+          description: |
+            Average prefix cache hit rate = {{ $value | humanizePercentage }}.
+            Routing may not be sticky enough. Investigate eviction policy and routing weights.
+
+      - alert: PrefixCacheHitRateDrop
+        expr: |
+          (
+            avg(vllm_prefix_cache_hit_rate)
+            - avg(vllm_prefix_cache_hit_rate offset 1h)
+          ) < -0.20
+        for: 5m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "Prefix cache hit rate dropped > 20% in 1 hour"
+          description: |
+            Current hit rate = {{ $value | humanizePercentage }}.
+            Possible causes: node restart (cold cache), eviction policy too aggressive,
+            or traffic pattern shift.
+
+      # ── Infrastructure alerts ─────────────────────────────────────────────
+
+      - alert: VLLMNodeDown
+        expr: |
+          up{job="vllm-metrics"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: ml-platform
+        annotations:
+          summary: "vLLM node {{ $labels.instance }} is down"
+          description: |
+            Prometheus scrape of {{ $labels.instance }} has failed for > 1 minute.
+            Envoy outlier detection should have ejected this node.
+
+      - alert: XDSControlPlaneDown
+        expr: |
+          up{job="xds-server"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: ml-platform
+        annotations:
+          summary: "xDS control plane is unreachable"
+          description: |
+            The xDS server is down. Envoy proxies cannot receive cluster updates.
+            Existing connections will continue to work, but new pods will not be discovered.
+
+      - alert: ExtProcHighLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(grpc_server_handling_seconds_bucket{grpc_service="envoy.service.ext_proc.v3.ExternalProcessor"}[5m])) by (le)
+          ) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "ext_proc routing latency p99 > 100ms"
+          description: |
+            The routing decision engine is adding > 100ms overhead to requests.
+            Check metrics API latency and ext_proc server load.

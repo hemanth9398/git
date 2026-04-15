@@ -1,0 +1,164 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: vllm-prefill-cluster
+  namespace: inference-gateway
+  labels:
+    app: vllm-prefill
+    component: inference-gateway
+spec:
+  rayVersion: "2.10.0"
+
+  # ── Head node ─────────────────────────────────────────────────────────────
+  headGroupSpec:
+    serviceType: ClusterIP
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+      num-cpus: "4"
+      num-gpus: "0"  # Head node does not serve inference
+      block: "true"
+    template:
+      metadata:
+        labels:
+          role: head
+          app: vllm-prefill
+      spec:
+        nodeSelector:
+          node-role: inference-head
+        tolerations:
+          - key: nvidia.com/gpu
+            operator: Exists
+            effect: NoSchedule
+        containers:
+          - name: ray-head
+            image: rayproject/ray-ml:2.10.0-gpu
+            ports:
+              - containerPort: 6379   # Redis (Ray GCS)
+              - containerPort: 8265   # Dashboard
+              - containerPort: 10001  # Ray client
+            resources:
+              requests:
+                cpu: "4"
+                memory: "16Gi"
+              limits:
+                cpu: "8"
+                memory: "32Gi"
+            env:
+              - name: RAY_DISABLE_DOCKER_CPU_WARNING
+                value: "1"
+            volumeMounts:
+              - name: shm
+                mountPath: /dev/shm
+        volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 16Gi
+
+  # ── Prefill worker group ───────────────────────────────────────────────────
+  workerGroupSpecs:
+    - groupName: prefill-workers
+      replicas: 8
+      minReplicas: 4
+      maxReplicas: 32
+      rayStartParams:
+        num-gpus: "8"
+        num-cpus: "64"
+        block: "true"
+      template:
+        metadata:
+          labels:
+            role: prefill-worker
+            app: vllm-prefill
+        spec:
+          # Schedule on H100 SXM5 node pool (high FLOP/s for prefill).
+          nodeSelector:
+            cloud.google.com/gke-accelerator: nvidia-h100-80gb
+            node-role: prefill
+          tolerations:
+            - key: nvidia.com/gpu
+              operator: Exists
+              effect: NoSchedule
+            - key: prefill-only
+              operator: Exists
+              effect: NoSchedule
+          affinity:
+            podAntiAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 100
+                  podAffinityTerm:
+                    labelSelector:
+                      matchLabels:
+                        role: prefill-worker
+                    topologyKey: kubernetes.io/hostname
+          initContainers:
+            - name: wait-for-gcs
+              image: busybox:1.36
+              command: ["sh", "-c", "until nc -z ${RAY_HEAD_SERVICE_HOST} 6379; do sleep 2; done"]
+          containers:
+            - name: vllm-prefill
+              image: vllm/vllm-openai:v0.4.3
+              command:
+                - python
+                - /workspace/prefill_worker.py
+              ports:
+                - name: http
+                  containerPort: 8000
+                - name: metrics
+                  containerPort: 8001
+              env:
+                - name: VLLM_WORKER_MULTIPROC_METHOD
+                  value: spawn
+                - name: VLLM_WORKER_USE_RAY
+                  value: "1"
+                - name: NCCL_DEBUG
+                  value: WARN
+                - name: VLLM_ROLE
+                  value: prefill
+                # KV-cache transfer target (decode fleet headless service).
+                - name: DECODE_SERVICE_HOST
+                  value: vllm-decode-headless.inference-gateway.svc.cluster.local
+                - name: DECODE_SERVICE_PORT
+                  value: "8100"
+              resources:
+                requests:
+                  cpu: "60"
+                  memory: "480Gi"
+                  nvidia.com/gpu: "8"
+                limits:
+                  cpu: "64"
+                  memory: "512Gi"
+                  nvidia.com/gpu: "8"
+              readinessProbe:
+                httpGet:
+                  path: /health
+                  port: 8000
+                initialDelaySeconds: 60
+                periodSeconds: 10
+                failureThreshold: 3
+              livenessProbe:
+                httpGet:
+                  path: /health
+                  port: 8000
+                initialDelaySeconds: 120
+                periodSeconds: 30
+                failureThreshold: 5
+              lifecycle:
+                preStop:
+                  exec:
+                    # Drain in-flight requests before pod terminates.
+                    command: ["/bin/sh", "-c", "sleep 30"]
+              volumeMounts:
+                - name: shm
+                  mountPath: /dev/shm
+                - name: model-cache
+                  mountPath: /model-cache
+          volumes:
+            - name: shm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 64Gi
+            - name: model-cache
+              persistentVolumeClaim:
+                claimName: model-weights-pvc
+          terminationGracePeriodSeconds: 60

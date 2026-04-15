@@ -1,0 +1,120 @@
+# Node affinity rules and taints for GPU inference node pools.
+# Apply these to the GKE/EKS node pools to ensure workloads land on the
+# correct GPU hardware.
+---
+# NodePool label/taint spec for H100 SXM5 prefill nodes.
+# On GKE: gcloud container node-pools create prefill-pool \
+#   --machine-type=a3-highgpu-8g \
+#   --accelerator=type=nvidia-h100-80gb,count=8 \
+#   --node-labels=node-role=prefill \
+#   --node-taints=prefill-only=true:NoSchedule
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prefill-node-pool-spec
+  namespace: inference-gateway
+data:
+  node_pool: prefill-pool
+  machine_type: a3-highgpu-8g
+  accelerator: nvidia-h100-80gb
+  accelerator_count: "8"
+  node_labels: |
+    node-role: prefill
+    cloud.google.com/gke-accelerator: nvidia-h100-80gb
+    topology.kubernetes.io/zone: us-central1-a
+  node_taints: |
+    prefill-only=true:NoSchedule
+    nvidia.com/gpu=present:NoSchedule
+
+---
+# NodePool label/taint spec for A100 PCIe decode nodes.
+# On GKE: gcloud container node-pools create decode-pool \
+#   --machine-type=a2-highgpu-8g \
+#   --accelerator=type=nvidia-a100-80gb,count=8 \
+#   --node-labels=node-role=decode \
+#   --node-taints=decode-only=true:NoSchedule
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: decode-node-pool-spec
+  namespace: inference-gateway
+data:
+  node_pool: decode-pool
+  machine_type: a2-highgpu-8g
+  accelerator: nvidia-a100-80gb
+  accelerator_count: "8"
+  node_labels: |
+    node-role: decode
+    cloud.google.com/gke-accelerator: nvidia-a100-80gb
+    topology.kubernetes.io/zone: us-central1-b
+  node_taints: |
+    decode-only=true:NoSchedule
+    nvidia.com/gpu=present:NoSchedule
+
+---
+# RuntimeClass for NVIDIA GPU workloads (uses nvidia container runtime).
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: nvidia
+handler: nvidia
+
+---
+# PriorityClass: high-priority for production inference requests.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority
+value: 1000000
+globalDefault: false
+description: "High priority for production LLM inference pods"
+
+---
+# PriorityClass: batch inference (lower priority, can be preempted).
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: batch-priority
+value: 100000
+globalDefault: false
+description: "Batch priority for non-interactive LLM inference"
+
+---
+# ServiceAccount with RBAC for vLLM pods to read their own pod metadata.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vllm-inference-sa
+  namespace: inference-gateway
+  annotations:
+    # GKE Workload Identity binding (replace with your project/SA).
+    iam.gke.io/gcp-service-account: vllm-inference@PROJECT_ID.iam.gserviceaccount.com
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vllm-pod-reader
+  namespace: inference-gateway
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "endpoints"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["ray.io"]
+    resources: ["rayclusters"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vllm-pod-reader-binding
+  namespace: inference-gateway
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: vllm-pod-reader
+subjects:
+  - kind: ServiceAccount
+    name: vllm-inference-sa
+    namespace: inference-gateway

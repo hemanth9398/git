@@ -1,0 +1,29 @@
+apiVersion: v2
+name: inference-gateway
+description: Envoy-based LLM Inference Gateway for vLLM fleets with KV-cache aware routing
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - llm
+  - inference
+  - envoy
+  - vllm
+  - kuberay
+home: https://github.com/your-org/inference-gateway
+maintainers:
+  - name: ML Platform Team
+    email: ml-platform@example.com
+dependencies:
+  - name: envoy-gateway
+    version: "1.0.*"
+    repository: "https://charts.gateway.envoyproxy.io"
+    condition: envoyGateway.enabled
+  - name: kube-prometheus-stack
+    version: "58.*"
+    repository: "https://prometheus-community.github.io/helm-charts"
+    condition: monitoring.enabled
+  - name: redis
+    version: "19.*"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: redis.enabled
