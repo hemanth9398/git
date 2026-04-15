@@ -1,8 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	"go.uber.org/zap"

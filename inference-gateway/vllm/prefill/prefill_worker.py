@@ -178,7 +178,7 @@ async def _handle_request(req: CompletionRequest, http_req: Request):
     except Exception as exc:
         REQUESTS_TOTAL.labels(status="error").inc()
         logger.exception("Request %s failed", request_id)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail="Internal inference error") from exc
 
 
 async def _generate_full(request_id: str, prompt: str, params: SamplingParams) -> dict:
@@ -219,7 +219,7 @@ async def _stream_generate(
     except Exception as exc:
         REQUESTS_TOTAL.labels(status="error").inc()
         logger.exception("Streaming request %s failed", request_id)
-        yield f"data: {{\"error\": \"{exc}\"}}\n\n"
+        yield "data: {\"error\": \"Internal inference error\"}\n\n"
 
 
 def _extract_prompt(req: CompletionRequest) -> str:
@@ -237,9 +237,28 @@ async def metrics_loop():
     while True:
         try:
             if engine is not None:
-                stats = await engine.get_model_config()
-                # Update KV-cache usage gauge.
-                # (Engine exposes this via do_log_stats in vLLM 0.4+.)
+                # vLLM 0.4+ exposes scheduler stats via do_log_stats().
+                # We scrape the /metrics endpoint ourselves since the engine
+                # internal API varies across vLLM versions.
+                import httpx
+                async with httpx.AsyncClient(timeout=2.0) as client:
+                    resp = await client.get(f"http://localhost:{METRICS_PORT}/metrics")
+                    if resp.status_code == 200:
+                        for line in resp.text.splitlines():
+                            if line.startswith("#") or not line.strip():
+                                continue
+                            if "gpu_cache_usage_perc" in line:
+                                try:
+                                    val = float(line.rsplit(" ", 1)[-1])
+                                    KV_CACHE_USAGE.set(val)
+                                except ValueError:
+                                    pass
+                            elif "num_requests_waiting" in line:
+                                try:
+                                    val = float(line.rsplit(" ", 1)[-1])
+                                    QUEUE_DEPTH.set(val)
+                                except ValueError:
+                                    pass
         except Exception:
             pass
         await asyncio.sleep(5)
