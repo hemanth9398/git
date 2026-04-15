@@ -1,0 +1,42 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: inference-gateway
+
+resources:
+  - ../../base
+
+# Production patches: higher replica counts, production model, stricter resources.
+patches:
+  - target:
+      kind: ConfigMap
+      name: vllm-config
+    patch: |-
+      - op: replace
+        path: /data/model_name
+        value: "meta-llama/Llama-3-70b-Instruct"
+      - op: replace
+        path: /data/gpu_memory_utilization
+        value: "0.92"
+
+commonLabels:
+  environment: prod
+  tier: production
+
+# Production image tags (pinned to specific digest for reproducibility).
+images:
+  - name: vllm/vllm-openai
+    newTag: v0.4.3
+  - name: your-registry/xds-server
+    newTag: "1.0.0"
+  - name: your-registry/ext-proc-server
+    newTag: "1.0.0"
+  - name: your-registry/metrics-collector
+    newTag: "1.0.0"
+
+configMapGenerator:
+  - name: prod-gateway-config
+    literals:
+      - ENVIRONMENT=production
+      - LOG_LEVEL=warn
+      - ENABLE_TRACING=true
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.monitoring.svc.cluster.local:4317

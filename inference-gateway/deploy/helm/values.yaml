@@ -1,0 +1,146 @@
+# ── Global settings ────────────────────────────────────────────────────────
+global:
+  namespace: inference-gateway
+  imageRegistry: ""
+  imagePullSecrets: []
+
+# ── Model configuration ────────────────────────────────────────────────────
+model:
+  name: "meta-llama/Llama-3-70b-Instruct"
+  tensorParallelSize: 8
+  maxModelLen: 32768
+  kvBlockSize: 16
+  gpuMemoryUtilization: 0.90
+  enablePrefixCaching: true
+  kvCacheDtype: "fp8"
+
+# ── xDS control plane ──────────────────────────────────────────────────────
+xds:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: your-registry/xds-server
+    tag: "1.0.0"
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 18000
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"
+
+# ── ext_proc routing filter ────────────────────────────────────────────────
+extProc:
+  enabled: true
+  replicaCount: 3
+  image:
+    repository: your-registry/ext-proc-server
+    tag: "1.0.0"
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 9090
+  routing:
+    prefixTokens: 256
+    alphaWeight: 0.40    # prefix cache hit rate weight
+    betaWeight: 0.35     # KV-cache headroom weight
+    gammaWeight: 0.25    # queue depth headroom weight
+  resources:
+    requests:
+      cpu: "1"
+      memory: "1Gi"
+    limits:
+      cpu: "4"
+      memory: "4Gi"
+
+# ── Metrics collector ─────────────────────────────────────────────────────
+metrics:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: your-registry/metrics-collector
+    tag: "1.0.0"
+  scrapeInterval: "5s"
+  service:
+    type: ClusterIP
+    port: 9091
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+
+# ── KubeRay cluster ───────────────────────────────────────────────────────
+kuberay:
+  enabled: true
+  prefill:
+    replicas: 8
+    minReplicas: 4
+    maxReplicas: 32
+    gpuType: nvidia-h100-80gb
+    gpuCount: 8
+    nodeRole: prefill
+  decode:
+    replicas: 16
+    minReplicas: 8
+    maxReplicas: 64
+    gpuType: nvidia-a100-80gb
+    gpuCount: 8
+    nodeRole: decode
+
+# ── Redis (distributed prefix cache metadata) ─────────────────────────────
+redis:
+  enabled: true
+  architecture: replication
+  auth:
+    enabled: true
+    existingSecret: ray-redis-secret
+  master:
+    persistence:
+      size: 20Gi
+  replica:
+    replicaCount: 3
+
+# ── Monitoring stack ─────────────────────────────────────────────────────
+monitoring:
+  enabled: true
+  grafana:
+    enabled: true
+    dashboards:
+      enabled: true
+  prometheus:
+    enabled: true
+    retention: 30d
+    storage: 100Gi
+
+# ── Envoy Gateway ─────────────────────────────────────────────────────────
+envoyGateway:
+  enabled: true
+
+# ── Autoscaling (KEDA) ────────────────────────────────────────────────────
+autoscaling:
+  enabled: true
+  decode:
+    queueDepthThreshold: 30
+    kvCacheThreshold: 80
+  prefill:
+    queueDepthThreshold: 20
+
+# ── TLS ───────────────────────────────────────────────────────────────────
+tls:
+  enabled: true
+  secretName: inference-gateway-tls
+  # Set to true to use cert-manager for automatic certificate provisioning.
+  certManager:
+    enabled: false
+    issuerName: letsencrypt-prod
+
+# ── Network policies ───────────────────────────────────────────────────────
+networkPolicy:
+  enabled: true

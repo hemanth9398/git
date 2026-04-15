@@ -1,0 +1,99 @@
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: BackendLBPolicy
+metadata:
+  name: vllm-decode-lb-policy
+  namespace: inference-gateway
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: vllm-decode
+  sessionPersistence:
+    # Sticky sessions via x-route-to-node header (set by ext_proc).
+    # This ensures a request that benefits from prefix-cache affinity is
+    # routed to the same node across a multi-turn conversation.
+    type: Header
+    headerName: x-route-to-node
+    absoluteTimeout: 30m
+  # Least-outstanding-requests for fair distribution when no sticky node.
+
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: BackendLBPolicy
+metadata:
+  name: vllm-prefill-lb-policy
+  namespace: inference-gateway
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: vllm-prefill
+  sessionPersistence:
+    type: Header
+    headerName: x-route-to-node
+    absoluteTimeout: 5m
+
+---
+# BackendTLSPolicy: enforce mTLS between Envoy and vLLM pods.
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: BackendTLSPolicy
+metadata:
+  name: vllm-backend-tls
+  namespace: inference-gateway
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: vllm-decode
+    - group: ""
+      kind: Service
+      name: vllm-prefill
+  validation:
+    caCertificateRefs:
+      - kind: ConfigMap
+        name: vllm-ca-bundle
+    hostname: vllm.inference-gateway.svc.cluster.local
+
+---
+# RateLimitPolicy: global token-bucket rate limiting per API key.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: inference-rate-limit
+  namespace: inference-gateway
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: inference-routes
+  rateLimit:
+    type: Global
+    global:
+      rules:
+        # Tier-1 customers: 1000 req/min per API key.
+        - clientSelectors:
+            - headers:
+                - name: X-Tier
+                  value: tier-1
+          limit:
+            requests: 1000
+            unit: Minute
+        # Tier-2 customers: 200 req/min per API key.
+        - clientSelectors:
+            - headers:
+                - name: X-Tier
+                  value: tier-2
+          limit:
+            requests: 200
+            unit: Minute
+        # Default: 60 req/min.
+        - limit:
+            requests: 60
+            unit: Minute
+  circuitBreaker:
+    maxConnections: 10000
+    maxPendingRequests: 5000
+    maxParallelRequests: 20000
+    maxParallelRetries: 100
+  proxyProtocol:
+    version: V2

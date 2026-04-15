@@ -1,0 +1,129 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "inference-gateway.fullname" . }}-xds
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    app: xds-server
+    component: inference-gateway
+spec:
+  replicas: {{ .Values.xds.replicaCount }}
+  selector:
+    matchLabels:
+      app: xds-server
+  template:
+    metadata:
+      labels:
+        app: xds-server
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: xds-server
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: xds-server
+          image: "{{ .Values.xds.image.repository }}:{{ .Values.xds.image.tag }}"
+          imagePullPolicy: {{ .Values.xds.image.pullPolicy }}
+          args:
+            - --xds-port={{ .Values.xds.service.port }}
+            - --namespace={{ .Values.global.namespace }}
+            - --prefill-service=vllm-prefill
+            - --decode-service=vllm-decode
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.xds.service.port }}
+            - name: metrics
+              containerPort: 8080
+          resources:
+            {{- toYaml .Values.xds.resources | nindent 12 }}
+          readinessProbe:
+            grpc:
+              port: {{ .Values.xds.service.port }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            grpc:
+              port: {{ .Values.xds.service.port }}
+            initialDelaySeconds: 20
+            periodSeconds: 30
+      serviceAccountName: vllm-inference-sa
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: xds-server
+  namespace: {{ .Values.global.namespace }}
+spec:
+  selector:
+    app: xds-server
+  ports:
+    - name: grpc
+      port: {{ .Values.xds.service.port }}
+      targetPort: {{ .Values.xds.service.port }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "inference-gateway.fullname" . }}-ext-proc
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    app: ext-proc-server
+    component: inference-gateway
+spec:
+  replicas: {{ .Values.extProc.replicaCount }}
+  selector:
+    matchLabels:
+      app: ext-proc-server
+  template:
+    metadata:
+      labels:
+        app: ext-proc-server
+    spec:
+      containers:
+        - name: ext-proc
+          image: "{{ .Values.extProc.image.repository }}:{{ .Values.extProc.image.tag }}"
+          args:
+            - --addr=:{{ .Values.extProc.service.port }}
+            - --metrics-addr=metrics-server.{{ .Values.global.namespace }}.svc.cluster.local:9091
+            - --prefix-tokens={{ .Values.extProc.routing.prefixTokens }}
+            - --alpha={{ .Values.extProc.routing.alphaWeight }}
+            - --beta={{ .Values.extProc.routing.betaWeight }}
+            - --gamma={{ .Values.extProc.routing.gammaWeight }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.extProc.service.port }}
+          resources:
+            {{- toYaml .Values.extProc.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ext-proc-server
+  namespace: {{ .Values.global.namespace }}
+spec:
+  selector:
+    app: ext-proc-server
+  ports:
+    - name: grpc
+      port: {{ .Values.extProc.service.port }}
+      targetPort: {{ .Values.extProc.service.port }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-config
+  namespace: {{ .Values.global.namespace }}
+data:
+  model_name: {{ .Values.model.name | quote }}
+  tensor_parallel_size: {{ .Values.model.tensorParallelSize | quote }}
+  max_model_len: {{ .Values.model.maxModelLen | quote }}
+  kv_block_size: {{ .Values.model.kvBlockSize | quote }}
+  gpu_memory_utilization: {{ .Values.model.gpuMemoryUtilization | quote }}
+  enable_prefix_caching: {{ .Values.model.enablePrefixCaching | quote }}
+  kv_cache_dtype: {{ .Values.model.kvCacheDtype | quote }}

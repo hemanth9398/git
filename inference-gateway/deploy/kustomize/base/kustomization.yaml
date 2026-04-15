@@ -1,0 +1,93 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: inference-gateway
+  labels:
+    app: inference-gateway
+    environment: base
+    istio-injection: enabled
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-config
+  namespace: inference-gateway
+data:
+  model_name: "meta-llama/Llama-3-70b-Instruct"
+  tensor_parallel_size: "8"
+  max_model_len: "32768"
+  kv_block_size: "16"
+  gpu_memory_utilization: "0.90"
+  enable_prefix_caching: "true"
+  kv_cache_dtype: "fp8"
+
+---
+# Network policy: vLLM pods only accept traffic from Envoy proxies.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vllm-ingress-policy
+  namespace: inference-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app: vllm-inference
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: envoy-gateway
+        - podSelector:
+            matchLabels:
+              app: ext-proc-server
+      ports:
+        - protocol: TCP
+          port: 8000
+    # Allow Prometheus scraping from the monitoring namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8001
+
+---
+# PersistentVolumeClaim for model weights (backed by Filestore NFS).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-weights-pvc
+  namespace: inference-gateway
+spec:
+  accessModes:
+    - ReadOnlyMany
+  storageClassName: filestore-rwx
+  resources:
+    requests:
+      storage: 500Gi
+
+---
+# ServiceMonitor for Prometheus to scrape vLLM metrics.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: vllm-metrics
+  namespace: inference-gateway
+  labels:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app: vllm-inference
+  endpoints:
+    - port: metrics
+      interval: 10s
+      path: /metrics
+      scrapeTimeout: 5s
+  namespaceSelector:
+    matchNames:
+      - inference-gateway

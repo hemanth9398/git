@@ -1,0 +1,95 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: inference-gateway
+  namespace: inference-gateway
+  annotations:
+    # Use Envoy Gateway as the implementation.
+    gateway.envoyproxy.io/owning-gatewayclass: inference-gateway-class
+spec:
+  gatewayClassName: inference-gateway-class
+  listeners:
+    # HTTPS listener (production traffic).
+    - name: https
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: inference-gateway-tls
+            namespace: inference-gateway
+      allowedRoutes:
+        namespaces:
+          from: Same
+
+    # HTTP listener (redirects to HTTPS, also used for health checks).
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: Same
+
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: inference-gateway-class
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: inference-gateway-proxy
+    namespace: inference-gateway
+
+---
+# EnvoyProxy customization: sets bootstrap overrides and extension services.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: inference-gateway-proxy
+  namespace: inference-gateway
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyDeployment:
+        replicas: 3
+        pod:
+          annotations:
+            prometheus.io/scrape: "true"
+            prometheus.io/port: "19001"
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app: envoy-gateway
+                  topologyKey: kubernetes.io/hostname
+        container:
+          resources:
+            requests:
+              cpu: "2"
+              memory: "2Gi"
+            limits:
+              cpu: "8"
+              memory: "8Gi"
+          env:
+            - name: GOGC
+              value: "100"
+  telemetry:
+    metrics:
+      prometheus: {}
+    accessLog:
+      settings:
+        - format:
+            type: JSON
+          sinks:
+            - type: OpenTelemetry
+              openTelemetry:
+                host: otel-collector.monitoring.svc.cluster.local
+                port: 4317
+                resources:
+                  service.name: envoy-inference-gateway

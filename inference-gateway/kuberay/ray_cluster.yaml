@@ -1,0 +1,305 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: vllm-inference-cluster
+  namespace: inference-gateway
+  labels:
+    app: vllm-inference
+    component: inference-gateway
+    version: "1.0.0"
+  annotations:
+    ray.io/ft-enabled: "true"  # Fault-tolerance: GCS persistent storage
+spec:
+  rayVersion: "2.10.0"
+
+  # ── Global Ray settings ────────────────────────────────────────────────
+  enableInTreeAutoscaling: true
+  autoscalerOptions:
+    upscalingMode: Default
+    idleTimeoutSeconds: 300
+    imagePullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: "500m"
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+
+  # ── Head node ─────────────────────────────────────────────────────────
+  headGroupSpec:
+    serviceType: ClusterIP
+    headService:
+      metadata:
+        labels:
+          app: vllm-inference
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+      num-cpus: "0"
+      num-gpus: "0"
+      block: "true"
+      # GCS fault tolerance backed by Redis.
+      redis-password: "$REDIS_PASSWORD"
+    template:
+      metadata:
+        labels:
+          role: head
+          app: vllm-inference
+        annotations:
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "8265"
+      spec:
+        nodeSelector:
+          node-role: inference-head
+        containers:
+          - name: ray-head
+            image: rayproject/ray-ml:2.10.0-gpu
+            ports:
+              - containerPort: 6379   # Redis/GCS
+              - containerPort: 8265   # Dashboard
+              - containerPort: 10001  # Ray client
+              - containerPort: 8080   # Metrics
+            env:
+              - name: RAY_DISABLE_DOCKER_CPU_WARNING
+                value: "1"
+              - name: REDIS_PASSWORD
+                valueFrom:
+                  secretKeyRef:
+                    name: ray-redis-secret
+                    key: password
+            resources:
+              requests:
+                cpu: "4"
+                memory: "16Gi"
+              limits:
+                cpu: "8"
+                memory: "32Gi"
+            readinessProbe:
+              httpGet:
+                path: /
+                port: 8265
+              initialDelaySeconds: 30
+              periodSeconds: 10
+            volumeMounts:
+              - name: shm
+                mountPath: /dev/shm
+        volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 8Gi
+        serviceAccountName: vllm-inference-sa
+        priorityClassName: high-priority
+
+  # ── Worker groups ──────────────────────────────────────────────────────
+  workerGroupSpecs:
+
+    # Prefill workers — H100 SXM5, compute-bound phase
+    - groupName: prefill-workers
+      replicas: 8
+      minReplicas: 4
+      maxReplicas: 32
+      rayStartParams:
+        num-gpus: "8"
+        num-cpus: "64"
+        block: "true"
+        resources: '{"prefill_slot": 1}'
+      template:
+        metadata:
+          labels:
+            role: prefill-worker
+            app: vllm-inference
+          annotations:
+            prometheus.io/scrape: "true"
+            prometheus.io/port: "8001"
+        spec:
+          nodeSelector:
+            cloud.google.com/gke-accelerator: nvidia-h100-80gb
+            node-role: prefill
+          tolerations:
+            - key: nvidia.com/gpu
+              operator: Exists
+              effect: NoSchedule
+            - key: prefill-only
+              operator: Exists
+              effect: NoSchedule
+          affinity:
+            podAntiAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 100
+                  podAffinityTerm:
+                    labelSelector:
+                      matchLabels:
+                        role: prefill-worker
+                    topologyKey: kubernetes.io/hostname
+          containers:
+            - name: vllm-prefill
+              image: vllm/vllm-openai:v0.4.3
+              command: ["python", "/workspace/prefill_worker.py"]
+              ports:
+                - name: http
+                  containerPort: 8000
+                - name: metrics
+                  containerPort: 8001
+              env:
+                - name: VLLM_ROLE
+                  value: prefill
+                - name: TENSOR_PARALLEL_SIZE
+                  value: "8"
+                - name: MODEL_NAME
+                  valueFrom:
+                    configMapKeyRef:
+                      name: vllm-config
+                      key: model_name
+                - name: DECODE_SERVICE_HOST
+                  value: vllm-decode-headless.inference-gateway.svc.cluster.local
+                - name: NODE_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
+              resources:
+                requests:
+                  cpu: "60"
+                  memory: "480Gi"
+                  nvidia.com/gpu: "8"
+                limits:
+                  cpu: "64"
+                  memory: "512Gi"
+                  nvidia.com/gpu: "8"
+              readinessProbe:
+                httpGet:
+                  path: /health
+                  port: 8000
+                initialDelaySeconds: 120
+                periodSeconds: 10
+                failureThreshold: 3
+              livenessProbe:
+                httpGet:
+                  path: /health
+                  port: 8000
+                initialDelaySeconds: 180
+                periodSeconds: 30
+                failureThreshold: 5
+              lifecycle:
+                preStop:
+                  exec:
+                    command: ["/bin/sh", "-c", "sleep 30"]
+              volumeMounts:
+                - name: shm
+                  mountPath: /dev/shm
+                - name: model-cache
+                  mountPath: /model-cache
+          volumes:
+            - name: shm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 64Gi
+            - name: model-cache
+              persistentVolumeClaim:
+                claimName: model-weights-pvc
+          terminationGracePeriodSeconds: 60
+          serviceAccountName: vllm-inference-sa
+
+    # Decode workers — A100 PCIe, memory-bandwidth-bound phase
+    - groupName: decode-workers
+      replicas: 16
+      minReplicas: 8
+      maxReplicas: 64
+      rayStartParams:
+        num-gpus: "8"
+        num-cpus: "64"
+        block: "true"
+        resources: '{"decode_slot": 1}'
+      template:
+        metadata:
+          labels:
+            role: decode-worker
+            app: vllm-inference
+          annotations:
+            prometheus.io/scrape: "true"
+            prometheus.io/port: "8001"
+        spec:
+          nodeSelector:
+            cloud.google.com/gke-accelerator: nvidia-a100-80gb
+            node-role: decode
+          tolerations:
+            - key: nvidia.com/gpu
+              operator: Exists
+              effect: NoSchedule
+            - key: decode-only
+              operator: Exists
+              effect: NoSchedule
+          affinity:
+            podAntiAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 100
+                  podAffinityTerm:
+                    labelSelector:
+                      matchLabels:
+                        role: decode-worker
+                    topologyKey: kubernetes.io/hostname
+          containers:
+            - name: vllm-decode
+              image: vllm/vllm-openai:v0.4.3
+              command: ["python", "/workspace/decode_worker.py"]
+              ports:
+                - name: http
+                  containerPort: 8000
+                - name: metrics
+                  containerPort: 8001
+                - name: kv-recv
+                  containerPort: 8100
+              env:
+                - name: VLLM_ROLE
+                  value: decode
+                - name: TENSOR_PARALLEL_SIZE
+                  value: "8"
+                - name: MODEL_NAME
+                  valueFrom:
+                    configMapKeyRef:
+                      name: vllm-config
+                      key: model_name
+                - name: NODE_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
+              resources:
+                requests:
+                  cpu: "60"
+                  memory: "480Gi"
+                  nvidia.com/gpu: "8"
+                limits:
+                  cpu: "64"
+                  memory: "512Gi"
+                  nvidia.com/gpu: "8"
+              readinessProbe:
+                httpGet:
+                  path: /health
+                  port: 8000
+                initialDelaySeconds: 120
+                periodSeconds: 10
+              livenessProbe:
+                httpGet:
+                  path: /health
+                  port: 8000
+                initialDelaySeconds: 180
+                periodSeconds: 30
+              lifecycle:
+                preStop:
+                  exec:
+                    command: ["/bin/sh", "-c", "sleep 30"]
+              volumeMounts:
+                - name: shm
+                  mountPath: /dev/shm
+                - name: model-cache
+                  mountPath: /model-cache
+          volumes:
+            - name: shm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 64Gi
+            - name: model-cache
+              persistentVolumeClaim:
+                claimName: model-weights-pvc
+          terminationGracePeriodSeconds: 60
+          serviceAccountName: vllm-inference-sa

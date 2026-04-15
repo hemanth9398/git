@@ -1,0 +1,40 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: inference-gateway-staging
+
+resources:
+  - ../../base
+
+# Staging: reduced replica counts, staging model, relaxed resources.
+patches:
+  - target:
+      kind: ConfigMap
+      name: vllm-config
+    patch: |-
+      - op: replace
+        path: /data/model_name
+        value: "meta-llama/Llama-3-8b-Instruct"
+      - op: replace
+        path: /data/tensor_parallel_size
+        value: "4"
+      - op: replace
+        path: /data/gpu_memory_utilization
+        value: "0.85"
+
+commonLabels:
+  environment: staging
+
+images:
+  - name: vllm/vllm-openai
+    newTag: v0.4.3-rc1
+  - name: your-registry/xds-server
+    newTag: "1.0.0-rc1"
+  - name: your-registry/ext-proc-server
+    newTag: "1.0.0-rc1"
+
+configMapGenerator:
+  - name: staging-gateway-config
+    literals:
+      - ENVIRONMENT=staging
+      - LOG_LEVEL=info
+      - ENABLE_TRACING=true
